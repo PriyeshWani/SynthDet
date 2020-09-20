@@ -41,6 +41,7 @@ unsafe public class ForegroundObjectPlacer : JobComponentSystem
     
     GameObjectOneWayCache m_OccludingObjectCache;
     GameObjectOneWayCache m_BackgroundInForegroundObjectCache;
+    GameObjectOneWayCache m_ForegroundObjectCache;
     MetricDefinition m_ForegroundPlacementInfoDefinition;
 
     // Initialize your operator here
@@ -118,9 +119,13 @@ unsafe public class ForegroundObjectPlacer : JobComponentSystem
             m_OccludingObjectCache = new GameObjectOneWayCache(m_ParentOccluding.transform, occludingObjects);
         if (m_BackgroundInForegroundObjectCache == null)
             m_BackgroundInForegroundObjectCache = new GameObjectOneWayCache(m_ParentBackgroundInForeground.transform, occludingObjects);
+        
+        if (m_ForegroundObjectCache == null)
+            m_ForegroundObjectCache = new GameObjectOneWayCache(m_ParentForeground.transform, statics.ForegroundPrefabs, SpawnForegroundObject);
 
         m_OccludingObjectCache.ResetAllObjects();
         m_BackgroundInForegroundObjectCache.ResetAllObjects();
+        m_ForegroundObjectCache.ResetAllObjects();
         
         using (s_PlaceObjects.Auto())
             placedObjectBoundingBoxes = PlaceObjects(camera, statics, occludingObjectBounds, ref curriculumState);
@@ -138,14 +143,26 @@ unsafe public class ForegroundObjectPlacer : JobComponentSystem
 
         return inputDeps;
     }
-    
+
+    GameObject SpawnForegroundObject(GameObject prefab)
+    {
+        var newParent = new GameObject();
+        newParent.transform.parent = m_ParentForeground.transform;
+        var gameObject = Object.Instantiate(prefab, newParent.transform);
+        var bounds = ObjectPlacementUtilities.ComputeBounds(gameObject);
+        gameObject.transform.localPosition -= bounds.center;
+        gameObject.layer = m_ForegroundLayer;
+        newParent.name = gameObject.name;
+        return newParent;
+    }
+
     void ReportObjectStats(PlacementStatics placementStatics, NativeList<PlacedObject> placedObjectBoundingBoxes, GameObject cameraObject)
     {
         var objectStates = new JArray();
         for (int i = 0; i < placedObjectBoundingBoxes.Length; i++)
         {
             var placedObject = placedObjectBoundingBoxes[i];
-            var labeling = m_ParentForeground.transform.GetChild(placedObject.PrefabIndex).GetChild(0).gameObject.GetComponent<Labeling>();
+            var labeling = m_ParentForeground.transform.GetChild(placedObject.ChildIndex).GetChild(0).gameObject.GetComponent<Labeling>();
             int labelId;
             if (placementStatics.IdLabelConfig.TryGetMatchingConfigurationEntry(labeling, out IdLabelEntry labelEntry))
                 labelId = labelEntry.id;
@@ -164,6 +181,7 @@ unsafe public class ForegroundObjectPlacer : JobComponentSystem
     struct PlacedObject : IEquatable<PlacedObject>
     {
         public int PrefabIndex;
+        public int ChildIndex;
         public float Scale;
         public Vector3 Position;
         public Rect BoundingBox;
@@ -173,7 +191,7 @@ unsafe public class ForegroundObjectPlacer : JobComponentSystem
 
         public bool Equals(PlacedObject other)
         {
-            return PrefabIndex == other.PrefabIndex && Scale.Equals(other.Scale) && Position.Equals(other.Position) && BoundingBox.Equals(other.BoundingBox) && Rotation.Equals(other.Rotation) && ProjectedArea.Equals(other.ProjectedArea) && IsOccluding == other.IsOccluding;
+            return PrefabIndex == other.PrefabIndex && ChildIndex == other.ChildIndex && Scale.Equals(other.Scale) && Position.Equals(other.Position) && BoundingBox.Equals(other.BoundingBox) && Rotation.Equals(other.Rotation) && ProjectedArea.Equals(other.ProjectedArea) && IsOccluding == other.IsOccluding;
         }
 
         public override bool Equals(object obj)
@@ -186,6 +204,7 @@ unsafe public class ForegroundObjectPlacer : JobComponentSystem
             unchecked
             {
                 var hashCode = PrefabIndex;
+                hashCode = (hashCode * 397) ^ ChildIndex;
                 hashCode = (hashCode * 397) ^ Scale.GetHashCode();
                 hashCode = (hashCode * 397) ^ Position.GetHashCode();
                 hashCode = (hashCode * 397) ^ BoundingBox.GetHashCode();
@@ -242,7 +261,8 @@ unsafe public class ForegroundObjectPlacer : JobComponentSystem
                 }
                 else
                 {
-                    prefabIndex = curriculumState.PrefabIndex;
+                    prefabIndex = RandomPtr->NextInt(0, NativePlacementStatics.ForegroundPrefabCount);
+                    //prefabIndex = curriculumState.PrefabIndex;
                     bounds = ObjectBounds[prefabIndex];
                 }
 
@@ -326,14 +346,14 @@ unsafe public class ForegroundObjectPlacer : JobComponentSystem
         using (s_SetupObjects.Auto())
         {
             var materialPropertyBlock = new MaterialPropertyBlock();
-            int objectGroupIndex = 0;
-            foreach (var placedObject in placedObjectBoundingBoxes)
+            for (var index = 0; index < placedObjectBoundingBoxes.Length; index++)
             {
+                var placedObject = placedObjectBoundingBoxes[index];
                 GameObject gameObject;
                 if (placedObject.IsOccluding)
                 {
                     gameObject = m_BackgroundInForegroundObjectCache.GetOrInstantiate(statics.BackgroundPrefabs[placedObject.PrefabIndex]);
-                    
+
                     var meshRenderer = gameObject.GetComponentInChildren<MeshRenderer>();
                     meshRenderer.GetPropertyBlock(materialPropertyBlock);
                     ObjectPlacementUtilities.CreateRandomizedHue(materialPropertyBlock, statics.OccludingHueMaxOffset, ref m_Rand);
@@ -342,8 +362,9 @@ unsafe public class ForegroundObjectPlacer : JobComponentSystem
                 }
                 else
                 {
-                    EnsureObjectGroupsExist(statics, objectGroupIndex);
-                    gameObject = m_ParentForeground.transform.GetChild(placedObject.PrefabIndex + objectGroupIndex * statics.ForegroundPrefabs.Length).gameObject;
+                    gameObject = m_ForegroundObjectCache.GetOrInstantiate(statics.ForegroundPrefabs[placedObject.PrefabIndex]);
+                    placedObject.ChildIndex = gameObject.transform.GetSiblingIndex();
+                    placedObjectBoundingBoxes[index] = placedObject;
                 }
 
                 gameObject.transform.localRotation = placedObject.Rotation;
@@ -351,9 +372,6 @@ unsafe public class ForegroundObjectPlacer : JobComponentSystem
                 gameObject.transform.localPosition = placedObject.Position;
 
                 ObjectPlacementUtilities.SetMeshRenderersEnabledRecursive(gameObject, true);
-
-                if (placedObject.PrefabIndex == statics.ForegroundPrefabs.Length - 1)
-                    objectGroupIndex++;
             }
         }
 
